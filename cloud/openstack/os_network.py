@@ -68,6 +68,7 @@ def main():
         shared=dict(default=False, type='bool'),
         admin_state_up=dict(default=True, type='bool'),
         state=dict(default='present', choices=['absent', 'present']),
+        provider_segmentation_id=dict(default=None),
     )
 
     module_kwargs = openstack_module_kwargs()
@@ -80,6 +81,7 @@ def main():
     name = module.params['name']
     shared = module.params['shared']
     admin_state_up = module.params['admin_state_up']
+    provider_segmentation_id = module.params['provider_segmentation_id']
 
     try:
         cloud = shade.openstack_cloud(**module.params)
@@ -87,7 +89,7 @@ def main():
 
         if state == 'present':
             if not net:
-                net = cloud.create_network(name, shared, admin_state_up)
+                net = cloud.create_network(name, shared, admin_state_up, provider_segmentation_id)
             module.exit_json(changed=False, network=net, id=net['id'])
 
         elif state == 'absent':
