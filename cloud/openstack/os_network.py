@@ -90,6 +90,7 @@ def main():
         if state == 'present':
             if not net:
                 net = cloud.create_network(name, shared, admin_state_up, provider_segmentation_id)
+                module.exit_json(changed=True, network=net, id=net['id'])
             module.exit_json(changed=False, network=net, id=net['id'])
 
         elif state == 'absent':
