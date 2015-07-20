@@ -389,6 +389,7 @@ from urlparse import urlparse
 try:
     import docker.client
     import docker.utils
+    import docker.errors
     from requests.exceptions import RequestException
 except ImportError:
     HAS_DOCKER_PY = False
@@ -529,6 +530,7 @@ class DockerManager(object):
             'extra_hosts': ((0, 7, 0), '1.3.1'),
             'pid': ((1, 0, 0), '1.17'),
             'log_driver': ((1, 2, 0), '1.18'),
+            'host_config': ((0, 7, 0), '1.15'),
             # Clientside only
             'insecure_registry': ((0, 5, 0), '0.0')
             }
@@ -737,6 +739,52 @@ class DockerManager(object):
             return exposed
         else:
             return None
+
+    def get_start_params(self):
+        """
+        Create start params
+        """
+        params = {
+            'lxc_conf': self.lxc_conf,
+            'binds': self.binds,
+            'port_bindings': self.port_bindings,
+            'publish_all_ports': self.module.params.get('publish_all_ports'),
+            'privileged': self.module.params.get('privileged'),
+            'links': self.links,
+            'network_mode': self.module.params.get('net'),
+        }
+
+        optionals = {}
+        for optional_param in ('dns', 'volumes_from', 'restart_policy',
+                'restart_policy_retry', 'pid'):
+            optionals[optional_param] = self.module.params.get(optional_param)
+
+        if optionals['dns'] is not None:
+            self.ensure_capability('dns')
+            params['dns'] = optionals['dns']
+
+        if optionals['volumes_from'] is not None:
+            self.ensure_capability('volumes_from')
+            params['volumes_from'] = optionals['volumes_from']
+
+        if optionals['restart_policy'] is not None:
+            self.ensure_capability('restart_policy')
+            params['restart_policy'] = { 'Name': optionals['restart_policy'] }
+            if params['restart_policy']['Name'] == 'on-failure':
+                params['restart_policy']['MaximumRetryCount'] = optionals['restart_policy_retry']
+
+        if optionals['pid'] is not None:
+            self.ensure_capability('pid')
+            params['pid_mode'] = optionals['pid']
+
+        return params
+
+    def get_host_config(self):
+        """
+        Create HostConfig object
+        """
+        params = self.get_start_params()
+        return docker.utils.create_host_config(**params)
 
     def get_port_bindings(self, ports):
         """
@@ -1270,6 +1318,10 @@ class DockerManager(object):
             if params['restart_policy']['Name'] == 'on-failure':
                 params['restart_policy']['MaximumRetryCount'] = optionals['restart_policy_retry']
 
+        # docker_py only accepts 'host' or None
+        if 'pid' in optionals and not optionals['pid']:
+            optionals['pid'] = None
+
         if optionals['pid'] is not None:
             self.ensure_capability('pid')
             params['pid_mode'] = optionals['pid']
@@ -1287,16 +1339,10 @@ class DockerManager(object):
         return docker.utils.create_host_config(**params)
 
     def create_containers(self, count=1):
-        try:
-            mem_limit = _human_to_bytes(self.module.params.get('memory_limit'))
-        except ValueError as e:
-            self.module.fail_json(msg=str(e))
-
         params = {'image':        self.module.params.get('image'),
                   'command':      self.module.params.get('command'),
                   'ports':        self.exposed_ports,
                   'volumes':      self.volumes,
-                  'mem_limit':    mem_limit,
                   'environment':  self.env,
                   'hostname':     self.module.params.get('hostname'),
                   'domainname':   self.module.params.get('domainname'),
@@ -1304,8 +1350,10 @@ class DockerManager(object):
                   'name':         self.module.params.get('name'),
                   'stdin_open':   self.module.params.get('stdin_open'),
                   'tty':          self.module.params.get('tty'),
-                  'host_config':  self.create_host_config(),
                   }
+
+        if self.ensure_capability('host_config', fail=False):
+            params['host_config'] = self.get_host_config()
 
         def do_create(count, params):
             results = []
@@ -1318,13 +1366,21 @@ class DockerManager(object):
 
         try:
             containers = do_create(count, params)
-        except:
+        except docker.errors.APIError as e:
+            if e.response.status_code != 404:
+                raise
+
             self.pull_image()
             containers = do_create(count, params)
 
         return containers
 
     def start_containers(self, containers):
+        params = {}
+
+        if not self.ensure_capability('host_config', fail=False):
+            params = self.get_start_params()
+
         for i in containers:
             self.client.start(i)
             self.increment_counter('started')
@@ -1552,10 +1608,14 @@ def main():
         if count > 1 and name:
             module.fail_json(msg="Count and name must not be used together")
 
-        # Explicitly pull new container images, if requested.
-        # Do this before noticing running and deployed containers so that the image names will differ
-        # if a newer image has been pulled.
-        if pull == "always":
+        # Explicitly pull new container images, if requested. Do this before
+        # noticing running and deployed containers so that the image names
+        # will differ if a newer image has been pulled.
+        # Missing images should be pulled first to avoid downtime when old
+        # container is stopped, but image for new one is now downloaded yet.
+        # It also prevents removal of running container before realizing
+        # that requested image cannot be retrieved.
+        if pull == "always" or (state == 'reloaded' and manager.get_inspect_image() is None):
             manager.pull_image()
 
         containers = ContainerSet(manager)
